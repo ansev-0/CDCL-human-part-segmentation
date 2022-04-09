@@ -1,6 +1,15 @@
 import os
 import argparse
-import sys
+import cv2
+import math
+import numpy as np
+import scipy.ndimage as sn
+from config_reader import config_reader
+from scipy.ndimage.filters import gaussian_filter
+from PIL import Image
+from tqdm import tqdm
+from model_simulated_RGB101 import get_testing_model_resnet101
+from human_seg.human_seg_gt import human_seg_combine_argmax
 
 parser = argparse.ArgumentParser(description='loading eval params')
 parser.add_argument('--gpus', metavar='N', type=int, default=1)
@@ -12,23 +21,6 @@ parser.add_argument('--average', type=bool, default=False)
 parser.add_argument('--scale', action='append', help='<Required> Set flag', required=True)
 
 args = parser.parse_args()
-
-import cv2
-import math
-import time
-import numpy as np
-import util
-from config_reader import config_reader
-from scipy.ndimage.filters import gaussian_filter
-from keras.models import load_model
-import code
-import copy
-import scipy.ndimage as sn
-from PIL import Image
-from tqdm import tqdm
-from model_simulated_RGB101 import get_testing_model_resnet101
-from human_seg.human_seg_gt import human_seg_combine_argmax
-
 
 right_part_idx = [2, 3, 4,  8,  9, 10, 14, 16]
 left_part_idx =  [5, 6, 7, 11, 12, 13, 15, 17]
@@ -61,30 +53,39 @@ flip_paf_idx = [20, 21, 12, 13, 22, 23,  24, 25, 14, 15, 16, 17, 6, 7, 8, 9, \
 x_paf_idx = [20, 12, 22, 24, 14, 16, 6, 8, \
                 10, 0, 2, 4, 28, 32, 36, 30, 34,26,18]
 
-def recover_flipping_output(oriImg, heatmap_ori_size, paf_ori_size, part_ori_size):
+def recover_flipping_output(ori_img, heatmap_ori_size, paf_ori_size, part_ori_size):
 
     heatmap_ori_size = heatmap_ori_size[:, ::-1, :]
-    heatmap_flip_size = np.zeros((oriImg.shape[0], oriImg.shape[1], 19))
+    heatmap_flip_size = np.zeros((ori_img.shape[0], ori_img.shape[1], 19))
     heatmap_flip_size[:,:,left_part_idx] = heatmap_ori_size[:,:,right_part_idx]
     heatmap_flip_size[:,:,right_part_idx] = heatmap_ori_size[:,:,left_part_idx]
     heatmap_flip_size[:,:,0:2] = heatmap_ori_size[:,:,0:2]
 
     paf_ori_size = paf_ori_size[:, ::-1, :]
-    paf_flip_size = np.zeros((oriImg.shape[0], oriImg.shape[1], 38))
+    paf_flip_size = np.zeros((ori_img.shape[0], ori_img.shape[1], 38))
     paf_flip_size[:,:,ori_paf_idx] = paf_ori_size[:,:,flip_paf_idx]
     paf_flip_size[:,:,x_paf_idx] = paf_flip_size[:,:,x_paf_idx]*-1
 
     part_ori_size = part_ori_size[:, ::-1, :]
-    part_flip_size = np.zeros((oriImg.shape[0], oriImg.shape[1], 15))
+    part_flip_size = np.zeros((ori_img.shape[0], ori_img.shape[1], 15))
     part_flip_size[:,:,human_ori_part] = part_ori_size[:,:,human_part]
     return heatmap_flip_size, paf_flip_size, part_flip_size
 
-def recover_flipping_output2(oriImg, part_ori_size):
+def recover_flipping_output2(ori_img, part_ori_size):
 
     part_ori_size = part_ori_size[:, ::-1, :]
-    part_flip_size = np.zeros((oriImg.shape[0], oriImg.shape[1], 15))
+    part_flip_size = np.zeros((ori_img.shape[0], ori_img.shape[1], 15))
     part_flip_size[:,:,human_ori_part] = part_ori_size[:,:,human_part]
     return part_flip_size
+
+def extract(blob, image_to_test_padded, pad, model_params, ori_img):
+    output = np.squeeze(blob) 
+    output = cv2.resize(output, (0, 0), fx=model_params['stride'], fy=model_params['stride'],
+                            interpolation=cv2.INTER_CUBIC)
+    output = output[:image_to_test_padded.shape[0] - pad[2], :image_to_test_padded.shape[1] - pad[3],
+                :]
+    return cv2.resize(output, (ori_img.shape[1], ori_img.shape[0]), interpolation=cv2.INTER_CUBIC)
+    
 
 def part_thresholding(seg_argmax):
     background = 0.6
@@ -104,161 +105,126 @@ def part_thresholding(seg_argmax):
     lefthand = 0.55
     righthand = 0.55
     
-    part_th = [background, head, torso, leftupperarm ,rightupperarm, leftforearm, rightforearm, lefthand, righthand, leftthigh, rightthigh, leftshank, rightshank, leftfoot, rightfoot]
-    th_mask = np.zeros(seg_argmax.shape)
-    for indx in range(15):
-        part_prediction = (seg_argmax==indx)
-        part_prediction = part_prediction*part_th[indx]
-        th_mask += part_prediction
-
-    return th_mask
+    part_th = [background, 
+               head, 
+               torso, 
+               leftupperarm,
+               rightupperarm, 
+               leftforearm, 
+               rightforearm, 
+               lefthand, 
+               righthand, 
+               leftthigh, 
+               rightthigh, leftshank, 
+               rightshank, 
+               leftfoot, 
+               rightfoot]
+    
+    return np.select([seg_argmax==i for i in range(15)], part_th, default=0)
 
 
 def process (input_image, params, model_params):
     input_scale = 1.0
 
-    oriImg = cv2.imread(input_image)
-    flipImg = cv2.flip(oriImg, 1)
-    oriImg = (oriImg / 256.0) - 0.5
+    ori_img = cv2.imread(input_image)
+    flipImg = cv2.flip(ori_img, 1)
+    ori_img = (ori_img / 256.0) - 0.5
     flipImg = (flipImg / 256.0) - 0.5
-    multiplier = [x * model_params['boxsize'] / oriImg.shape[0] for x in params['scale_search']]
+    multiplier = [x * model_params['boxsize'] / ori_img.shape[0] for x in params['scale_search']]
 
-    heatmap_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 19))
-    paf_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 38))
-    seg_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 15))
+    heatmap_avg = np.zeros((ori_img.shape[0], ori_img.shape[1], 19))
+    paf_avg = np.zeros((ori_img.shape[0], ori_img.shape[1], 38))
+    seg_avg = np.zeros((ori_img.shape[0], ori_img.shape[1], 15))
 
-    segmap_scale1 = np.zeros((oriImg.shape[0], oriImg.shape[1], seg_num))
-    segmap_scale2 = np.zeros((oriImg.shape[0], oriImg.shape[1], seg_num))
-    segmap_scale3 = np.zeros((oriImg.shape[0], oriImg.shape[1], seg_num))
-    segmap_scale4 = np.zeros((oriImg.shape[0], oriImg.shape[1], seg_num))
-
-    segmap_scale5 = np.zeros((oriImg.shape[0], oriImg.shape[1], seg_num))
-    segmap_scale6 = np.zeros((oriImg.shape[0], oriImg.shape[1], seg_num))
-    segmap_scale7 = np.zeros((oriImg.shape[0], oriImg.shape[1], seg_num))
-    segmap_scale8 = np.zeros((oriImg.shape[0], oriImg.shape[1], seg_num))
-
+    list_seg = []
+    
     for m in range(len(multiplier)):
         scale = multiplier[m]*input_scale
-        imageToTest = cv2.resize(oriImg, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        image_to_test = cv2.resize(ori_img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
         pad = [ 0,
                 0, 
-                (imageToTest.shape[0] - model_params['stride']) % model_params['stride'],
-                (imageToTest.shape[1] - model_params['stride']) % model_params['stride']
+                (image_to_test.shape[0] - model_params['stride']) % model_params['stride'],
+                (image_to_test.shape[1] - model_params['stride']) % model_params['stride']
               ]
         
-        imageToTest_padded = np.pad(imageToTest, ((0, pad[2]), (0, pad[3]), (0, 0)), mode='constant', constant_values=((0, 0), (0, 0), (0, 0)))
+        image_to_test_padded = np.pad(image_to_test, ((0, pad[2]), (0, pad[3]), (0, 0)), mode='constant', constant_values=((0, 0), (0, 0), (0, 0)))
 
-        input_img = imageToTest_padded[np.newaxis, ...]
+        input_img = image_to_test_padded[np.newaxis, ...]
         
         print( "\tActual size fed into NN: ", input_img.shape)
 
         output_blobs = model.predict(input_img)
 
-        heatmap = np.squeeze(output_blobs[1])  # output 1 is heatmaps
-        heatmap = cv2.resize(heatmap, (0, 0), fx=model_params['stride'], fy=model_params['stride'],
-                             interpolation=cv2.INTER_CUBIC)
-        heatmap = heatmap[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3],
-                  :]
-        heatmap = cv2.resize(heatmap, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
-
-        paf = np.squeeze(output_blobs[0])  # output 0 is PAFs
-        paf = cv2.resize(paf, (0, 0), fx=model_params['stride'], fy=model_params['stride'],
-                         interpolation=cv2.INTER_CUBIC)
-        paf = paf[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-        paf = cv2.resize(paf, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
-
-        seg = np.squeeze(output_blobs[2])
-        seg = cv2.resize(seg, (0, 0), fx=model_params['stride'], fy=model_params['stride'],
-                             interpolation=cv2.INTER_CUBIC)
-        seg = seg[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-        seg = cv2.resize(seg, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
-
-        if m==0:
-            segmap_scale1 = seg
-        elif m==1:
-            segmap_scale2 = seg         
-        elif m==2:
-            segmap_scale3 = seg
-        elif m==3:
-            segmap_scale4 = seg
-
+        paf, heatmap, seg = tuple(
+            map(lambda blob: extract(blob, 
+                                     image_to_test_padded, 
+                                     pad, 
+                                     model_params, 
+                                     ori_img),
+                output_blobs)
+        )
+        list_seg.append(seg)
 
     # flipping
     for m in range(len(multiplier)):
         scale = multiplier[m]
-        imageToTest = cv2.resize(flipImg, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        image_to_test = cv2.resize(flipImg, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         pad = [ 0,
                 0, 
-                (imageToTest.shape[0] - model_params['stride']) % model_params['stride'],
-                (imageToTest.shape[1] - model_params['stride']) % model_params['stride']
+                (image_to_test.shape[0] - model_params['stride']) % model_params['stride'],
+                (image_to_test.shape[1] - model_params['stride']) % model_params['stride']
               ]
         
-        imageToTest_padded = np.pad(imageToTest, ((0, pad[2]), (0, pad[3]), (0, 0)), mode='constant', constant_values=((0, 0), (0, 0), (0, 0)))
-        input_img = imageToTest_padded[np.newaxis, ...]
+        image_to_test_padded = np.pad(image_to_test, 
+                                      ((0, pad[2]), (0, pad[3]), (0, 0)), 
+                                      mode='constant', 
+                                      constant_values=((0, 0), (0, 0), (0, 0)))
+        
+        input_img = image_to_test_padded[np.newaxis, ...]
         print( "\tActual size fed into NN: ", input_img.shape)
         output_blobs = model.predict(input_img)
 
         # extract outputs, resize, and remove padding
-        heatmap = np.squeeze(output_blobs[1])  # output 1 is heatmaps
-        heatmap = cv2.resize(heatmap, (0, 0), fx=model_params['stride'], fy=model_params['stride'],interpolation=cv2.INTER_CUBIC)
-        heatmap = heatmap[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-        heatmap = cv2.resize(heatmap, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
-
-        paf = np.squeeze(output_blobs[0])  # output 0 is PAFs
-        paf = cv2.resize(paf, (0, 0), fx=model_params['stride'], fy=model_params['stride'],interpolation=cv2.INTER_CUBIC)
-        paf = paf[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-        paf = cv2.resize(paf, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
-
-        seg = np.squeeze(output_blobs[2])
-        seg = cv2.resize(seg, (0, 0), fx=model_params['stride'], fy=model_params['stride'],
-                             interpolation=cv2.INTER_CUBIC)
-        seg = seg[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-        seg = cv2.resize(seg, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
-
-        heatmap_recover, paf_recover, seg_recover = recover_flipping_output(oriImg, heatmap, paf, seg)
-
+        paf, heatmap, seg = tuple(map(lambda blob: extract(blob, 
+                                                           image_to_test_padded, 
+                                                           pad, 
+                                                           model_params, 
+                                                           ori_img),
+                                      output_blobs))
+        
+        heatmap_recover, paf_recover, seg_recover = recover_flipping_output(ori_img, heatmap, paf, seg)
+        list_seg.append(seg_recover)
         heatmap_avg = heatmap_avg + heatmap_recover
         paf_avg = paf_avg + paf_recover
-
-        if m==0:
-            segmap_scale5 = seg_recover
-        elif m==1:
-            segmap_scale6 = seg_recover         
-        elif m==2:
-            segmap_scale7 = seg_recover
-        elif m==3:
-            segmap_scale8 = seg_recover
 
     heatmap_avg = heatmap_avg / (len(multiplier)*2)
     paf_avg = paf_avg / (len(multiplier)*2)
 
-    segmap_a = np.maximum(segmap_scale1,segmap_scale2)
-    segmap_b = np.maximum(segmap_scale4,segmap_scale3)
-    segmap_c = np.maximum(segmap_scale5,segmap_scale6)
-    segmap_d = np.maximum(segmap_scale7,segmap_scale8)
-    seg_ori = np.maximum(segmap_a, segmap_b)
-    seg_flip = np.maximum(segmap_c, segmap_d)
-    seg_avg = np.maximum(seg_ori, seg_flip)
+    seg_avg = np.max(list_seg, axis=0) if list_seg else np.zeros((ori_img.shape[0], ori_img.shape[1], seg_num))
 
     all_peaks = []
     peak_counter = 0
 
     for part in range(18):
         map_ori = heatmap_avg[:, :, part]
-        map = gaussian_filter(map_ori, sigma=3)
+        map_gauss = gaussian_filter(map_ori, sigma=3)
 
-        map_left = np.zeros(map.shape)
-        map_left[1:, :] = map[:-1, :]
-        map_right = np.zeros(map.shape)
-        map_right[:-1, :] = map[1:, :]
-        map_up = np.zeros(map.shape)
-        map_up[:, 1:] = map[:, :-1]
-        map_down = np.zeros(map.shape)
-        map_down[:, :-1] = map[:, 1:]
+        map_left = np.zeros(map_gauss.shape)
+        map_left[1:, :] = map_gauss[:-1, :]
+        map_right = np.zeros(map_gauss.shape)
+        map_right[:-1, :] = map_gauss[1:, :]
+        map_up = np.zeros(map_gauss.shape)
+        map_up[:, 1:] = map_gauss[:, :-1]
+        map_down = np.zeros(map_gauss.shape)
+        map_down[:, :-1] = map_gauss[:, 1:]
 
         peaks_binary = np.logical_and.reduce(
-            (map >= map_left, map >= map_right, map >= map_up, map >= map_down, map > params['thre1']))
+            (map_gauss >= map_left, 
+             map_gauss >= map_right, 
+             map_gauss >= map_up,
+             map_gauss >= map_down,
+             map_gauss > params['thre1']))
         peaks = list(zip(np.nonzero(peaks_binary)[1], np.nonzero(peaks_binary)[0]))  # note reverse
         peaks_with_score = [x + (map_ori[x[1], x[0]],) for x in peaks]
         id = range(peak_counter, peak_counter + len(peaks))
@@ -301,7 +267,7 @@ def process (input_image, params, model_params):
 
                     score_midpts = np.multiply(vec_x, vec[0]) + np.multiply(vec_y, vec[1])
                     score_with_dist_prior = sum(score_midpts) / len(score_midpts) + min(
-                        0.5 * oriImg.shape[0] / norm - 1, 0)
+                        0.5 * ori_img.shape[0] / norm - 1, 0)
                     criterion1 = len(np.nonzero(score_midpts > params['thre2'])[0]) > 0.8 * len(
                         score_midpts)
                     criterion2 = score_with_dist_prior > 0
