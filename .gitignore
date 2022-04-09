@@ -1,0 +1,7 @@
+/**/*.h5
+*.h5
+.vscode
+/**/__pycache__
+__pycache__
+/output/*.jpg
+/input/*.jpg
