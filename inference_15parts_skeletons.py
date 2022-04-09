@@ -391,12 +391,7 @@ if __name__ == '__main__':
     model = get_testing_model_resnet101() 
     model.load_weights(keras_weights_file)
     params, model_params = config_reader()
-
-    scale_list = []
-    for item in args.scale:
-        scale_list.append(float(item))
-
-    params['scale_search'] = scale_list
+    params['scale_search'] = list(map(float, args.scale))
 
    
     # generate image with body parts
